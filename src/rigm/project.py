@@ -418,6 +418,56 @@ def extract_layer(path: str | Path, layer_id: str, actor: str = "agent") -> Path
     return sprite_path
 
 
+def import_sprite_layer(
+    path: str | Path,
+    name: str,
+    sprite_path: str | Path,
+    visible: bool = True,
+    provenance: dict[str, Any] | None = None,
+    actor: str = "agent",
+) -> str:
+    """Import a full-canvas RGBA pose or part as an editable project layer."""
+    project_path = Path(path).expanduser().resolve()
+    data = load_project(project_path)
+    if not name.strip():
+        raise ProjectError("La capa necesita un nombre.")
+    try:
+        with Image.open(Path(sprite_path).expanduser()) as opened:
+            sprite = opened.convert("RGBA")
+    except OSError as exc:
+        raise ProjectError(f"No pude leer la pieza: {exc}") from exc
+    expected_size = tuple(data.get("image_size", ()))
+    if sprite.size != expected_size:
+        raise ProjectError(f"La pieza debe medir {expected_size[0]}×{expected_size[1]} píxeles, mide {sprite.width}×{sprite.height}.")
+    if sprite.getchannel("A").getbbox() is None:
+        raise ProjectError("La pieza no contiene píxeles visibles.")
+    layer_id = f"layer-{uuid.uuid4().hex[:12]}"
+    sprite_relative = Path("assets") / "sprites" / f"{layer_id}.png"
+    mask_relative = Path("assets") / "masks" / f"{layer_id}.png"
+    sprite_file = project_path.parent / sprite_relative
+    mask_file = project_path.parent / mask_relative
+    sprite_file.parent.mkdir(parents=True, exist_ok=True)
+    mask_file.parent.mkdir(parents=True, exist_ok=True)
+    sprite.save(sprite_file, format="PNG")
+    mask = sprite.getchannel("A")
+    mask.save(mask_file, format="PNG")
+    source_path = Path(data["_image_path"])
+    source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    mask_hash = hashlib.sha256(mask_file.read_bytes()).hexdigest()
+    draw_order = max((int(layer.get("draw_order", index)) for index, layer in enumerate(data.get("layers", []))), default=-1) + 1
+    data.setdefault("layers", []).append({
+        "id": layer_id, "name": name.strip(), "mask": mask_relative.as_posix(),
+        "sprite": sprite_relative.as_posix(), "visible": bool(visible), "draw_order": draw_order,
+        "separation": {
+            "source_sha256": source_hash, "mask_sha256": mask_hash,
+            "method": "imported-pose-sprite", "created_at": now_utc(),
+        },
+        "provenance": dict(provenance or {}),
+    })
+    save_project(project_path, data, action=f"sprite_layer_imported:{layer_id}", actor=actor)
+    return layer_id
+
+
 def inpaint_layer_holes(
     path: str | Path,
     radius: float = 3.0,
@@ -512,7 +562,11 @@ def render_composite(path: str | Path) -> Image.Image:
     try:
         with Image.open(base_path) as base:
             composite = base.convert("RGBA")
-        for layer in layers:
+        ordered_layers = sorted(
+            enumerate(layers),
+            key=lambda pair: (int(pair[1].get("draw_order", pair[0])), pair[0]),
+        )
+        for _, layer in ordered_layers:
             sprite_value = layer.get("sprite")
             if not sprite_value or not layer.get("visible", True):
                 continue
@@ -630,11 +684,11 @@ def set_rotation_key(
     joint_id: str,
     frame: int,
     value: float,
-    interpolation: str = "smooth",
+    interpolation: str = "cubic",
     actor: str = "agent",
 ) -> None:
-    if interpolation not in {"smooth", "linear"}:
-        raise ProjectError("Interpolación no válida; usa 'smooth' o 'linear'.")
+    if interpolation not in {"smooth", "linear", "cubic"}:
+        raise ProjectError("Interpolación no válida; usa 'smooth', 'linear' o 'cubic'.")
     data = load_project(path)
     clip = next((item for item in data.get("animations", []) if item.get("id") == clip_id), None)
     if clip is None:
@@ -648,6 +702,30 @@ def set_rotation_key(
     track.append({"frame": int(frame), "value": float(value), "interpolation": interpolation})
     track.sort(key=lambda key: key["frame"])
     save_project(path, data, action=f"rotation_key_set:{clip_id}:{joint_id}:{frame}", actor=actor)
+
+
+def set_layer_visibility_key(
+    path: str | Path,
+    clip_id: str,
+    layer_id: str,
+    frame: int,
+    visible: bool,
+    actor: str = "agent",
+) -> None:
+    """Store a stepped visibility key for a layer in an animation clip."""
+    data = load_project(path)
+    clip = next((item for item in data.get("animations", []) if item.get("id") == clip_id), None)
+    if clip is None:
+        raise ProjectError(f"No existe el clip {clip_id}.")
+    if not any(item.get("id") == layer_id for item in data.get("layers", [])):
+        raise ProjectError(f"No existe la capa {layer_id}.")
+    if frame < 0 or frame > int(clip["duration"]):
+        raise ProjectError("El fotograma queda fuera de la duración del clip.")
+    track = clip.setdefault("layer_tracks", {}).setdefault(layer_id, {}).setdefault("visibility", [])
+    track[:] = [key for key in track if int(key["frame"]) != frame]
+    track.append({"frame": int(frame), "visible": bool(visible)})
+    track.sort(key=lambda key: key["frame"])
+    save_project(path, data, action=f"layer_visibility_key_set:{clip_id}:{layer_id}:{frame}", actor=actor)
 
 
 def create_expression(
@@ -732,6 +810,11 @@ def validate_project(path: str | Path) -> dict[str, Any]:
     data = load_project(project_path)
     errors: list[str] = []
     warnings: list[str] = []
+    from .avatar3d import validate_project_avatar
+    avatar_report = validate_project_avatar(data, project_path)
+    if avatar_report:
+        errors.extend(avatar_report["errors"])
+        warnings.extend(avatar_report["warnings"])
     source_size = None
     try:
         image_path = resolve_image(data, project_path)
@@ -896,6 +979,16 @@ def validate_project(path: str | Path) -> dict[str, Any]:
             frames = [int(key.get("frame", -1)) for key in track.get("rotation", [])]
             if any(frame < 0 or frame > int(clip.get("duration", 0)) for frame in frames):
                 errors.append(f"El clip {clip.get('name', clip.get('id'))} tiene claves fuera de su duración.")
+        layer_ids = {layer.get("id") for layer in layers}
+        for layer_id, track in clip.get("layer_tracks", {}).items():
+            if layer_id not in layer_ids:
+                errors.append(f"El clip {clip.get('name', clip.get('id'))} apunta a una capa inexistente.")
+            keys = track.get("visibility", [])
+            frames = [int(key.get("frame", -1)) for key in keys]
+            if any(frame < 0 or frame > int(clip.get("duration", 0)) for frame in frames):
+                errors.append(f"El clip {clip.get('name', clip.get('id'))} tiene claves de visibilidad fuera de su duración.")
+            if any(not isinstance(key.get("visible"), bool) for key in keys):
+                errors.append(f"El clip {clip.get('name', clip.get('id'))} tiene claves de visibilidad inválidas.")
     for expression in expressions:
         if any(joint_id not in known for joint_id in expression.get("joint_rotations", {})):
             errors.append(f"La expresión {expression.get('name', expression.get('id'))} apunta a una articulación inexistente.")
@@ -1032,7 +1125,7 @@ def import_decomposition_psd(
             "replaced_at": now_utc(), "layers": prior,
         })
         data["layers"] = [layer for layer in data.get("layers", []) if layer not in prior]
-    base_order = max((int(layer.get("draw_order", index)) for index, layer in enumerate(data.get("layers", []))), default=-1) + len(imported)
+    base_order = max((int(layer.get("draw_order", index)) for index, layer in enumerate(data.get("layers", []))), default=-1) + 1
     psd_relative = source_psd.relative_to(project_path.parent).as_posix()
     added_at = now_utc()
     group_id = f"group-ai-{uuid.uuid4().hex[:12]}" if group_layers else None
@@ -1049,7 +1142,7 @@ def import_decomposition_psd(
         data.setdefault("layers", []).append({
             "id": layer_id, "name": name, "mask": mask_relative.as_posix(),
             "sprite": sprite_relative.as_posix(), "visible": True,
-            "draw_order": base_order - index,
+            "draw_order": base_order + index,
             "separation": {
                 "source_sha256": source_hash, "mask_sha256": mask_hash,
                 "method": "see-through", "created_at": added_at,

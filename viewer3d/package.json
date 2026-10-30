@@ -1,0 +1,16 @@
+{
+  "name": "rigm-avatar3d-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build --base=./"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "^3.5.4",
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "vite": "^7.1.12"
+  }
+}

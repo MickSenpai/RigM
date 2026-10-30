@@ -27,6 +27,11 @@ def export_bundle(project: str | Path, output: str | Path) -> Path:
         for proposal in layer.get("mask_proposals", []):
             if proposal.get("mask"):
                 references.add(str(proposal["mask"]))
+    avatar = payload.get("avatar3d")
+    if isinstance(avatar, dict):
+        for field in ("path", "source_path"):
+            if avatar.get(field):
+                references.add(str(avatar[field]))
     assets: list[tuple[str, Path]] = []
     root = project_path.parent.resolve()
     for reference in sorted(references):
