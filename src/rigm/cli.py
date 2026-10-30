@@ -19,6 +19,7 @@ from .project import (
     extract_layer,
     inpaint_layer_holes,
     import_layer_mask,
+    import_sprite_layer,
     load_project,
     move_joint,
     propose_layer_masks,
@@ -29,10 +30,13 @@ from .project import (
     set_expression_value,
     set_joint_parent,
     set_rotation_key,
+    set_layer_visibility_key,
 )
 from .export import export_bundle
-from .rig import generate_layer_mesh, render_project_pose, sample_clip, set_vertex_weight, solve_two_bone_ik
+from .rig import generate_layer_mesh, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .decomposition import decompose_project_with_see_through
+from .behavior import BehaviorRuntime, BEHAVIOR_STATES, motion_event_from_agent
+from .avatar3d import attach_avatar, autorig_glb, validate_project_avatar, validate_glb, validate_vrm
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -79,6 +83,11 @@ def _parser() -> argparse.ArgumentParser:
     layer_import.add_argument("project")
     layer_import.add_argument("name")
     layer_import.add_argument("mask")
+    layer_sprite = layer_sub.add_parser("import-sprite", help="Importa una pieza RGBA de tamaño completo como capa editable.")
+    layer_sprite.add_argument("project")
+    layer_sprite.add_argument("name")
+    layer_sprite.add_argument("sprite")
+    layer_sprite.add_argument("--hidden", action="store_true", help="Importa la pieza oculta por defecto.")
     layer_extract = layer_sub.add_parser("extract", help="Extrae la pieza RGBA de una capa usando su máscara.")
     layer_extract.add_argument("project")
     layer_extract.add_argument("layer_id")
@@ -107,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     mesh_generate.add_argument("project")
     mesh_generate.add_argument("layer_id")
     mesh_generate.add_argument("--spacing", type=int, default=28)
+    mesh_generate.add_argument("--joint", help="Vincula rígidamente toda la pieza a esta articulación.")
 
     weight = sub.add_parser("weight", help="Edita los pesos normalizados de un vértice de malla.")
     weight_sub = weight.add_subparsers(dest="weight_action", required=True)
@@ -131,7 +141,13 @@ def _parser() -> argparse.ArgumentParser:
     clip_key.add_argument("joint_id")
     clip_key.add_argument("frame", type=int)
     clip_key.add_argument("rotation", type=float)
-    clip_key.add_argument("--interpolation", choices=("smooth", "linear"), default="smooth")
+    clip_key.add_argument("--interpolation", choices=("smooth", "linear", "cubic"), default="cubic")
+    clip_visibility = clip_sub.add_parser("visibility-key", help="Guarda una clave discreta para mostrar u ocultar una pieza.")
+    clip_visibility.add_argument("project")
+    clip_visibility.add_argument("clip_id")
+    clip_visibility.add_argument("layer_id")
+    clip_visibility.add_argument("frame", type=int)
+    clip_visibility.add_argument("visibility", choices=("visible", "hidden"))
 
     expression = sub.add_parser("expression", help="Crea expresiones de articulaciones y opacidad por capa.")
     expression_sub = expression.add_subparsers(dest="expression_action", required=True)
@@ -154,6 +170,7 @@ def _parser() -> argparse.ArgumentParser:
     ik_solve.add_argument("tip_id")
     ik_solve.add_argument("x", type=float)
     ik_solve.add_argument("y", type=float)
+    ik_solve.add_argument("--bend-direction", choices=("positive", "negative"), default="positive")
 
     pose = sub.add_parser("pose", help="Renderiza una pose, un fotograma o una expresión.")
     pose_sub = pose.add_subparsers(dest="pose_action", required=True)
@@ -164,6 +181,33 @@ def _parser() -> argparse.ArgumentParser:
     pose_render.add_argument("--frame", type=float, default=0)
     pose_render.add_argument("--expression")
     pose_render.add_argument("--rotation", nargs=2, action="append", default=[], metavar=("JOINT_ID", "DEGREES"))
+
+    avatar = sub.add_parser("avatar3d", help="Importa y prepara avatares 3D GLB/VRM.")
+    avatar_sub = avatar.add_subparsers(dest="avatar_action", required=True)
+    avatar_attach = avatar_sub.add_parser("attach", help="Valida y copia un GLB/VRM dentro del proyecto.")
+    avatar_attach.add_argument("project")
+    avatar_attach.add_argument("model")
+    avatar_autorig = avatar_sub.add_parser("autorig", help="Analiza un GLB sin rig y genera esqueleto/pesos usando Blender.")
+    avatar_autorig.add_argument("project")
+    avatar_autorig.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
+    avatar_autorig.add_argument("--forward-axis", choices=("-Y", "+Y", "-X", "+X"), default="-Y")
+    avatar_inspect = avatar_sub.add_parser("inspect", help="Muestra metadatos y capacidades del avatar registrado.")
+    avatar_inspect.add_argument("project")
+    avatar_validate = avatar_sub.add_parser("validate", help="Comprueba el avatar 3D y sus recursos.")
+    avatar_validate.add_argument("project")
+    avatar_file_validate = avatar_sub.add_parser("validate-file", help="Valida un archivo GLB/VRM antes de importarlo.")
+    avatar_file_validate.add_argument("model")
+
+    behavior = sub.add_parser("behavior", help="Previsualiza comportamientos reactivos con eventos estructurados.")
+    behavior_sub = behavior.add_subparsers(dest="behavior_action", required=True)
+    behavior_render = behavior_sub.add_parser("render", help="Renderiza una pose reactiva a un instante dado.")
+    behavior_render.add_argument("project")
+    behavior_render.add_argument("output")
+    behavior_render.add_argument("--state", choices=BEHAVIOR_STATES, default="idle")
+    behavior_render.add_argument("--seconds", type=float, default=2.0)
+    behavior_render.add_argument("--fps", type=int, default=30)
+    behavior_render.add_argument("--intensity", type=float, default=0.35)
+    behavior_render.add_argument("--event", action="append", default=[], help="Evento JSON externo; puede repetirse.")
 
     export = sub.add_parser("export", help="Empaqueta el proyecto y sus recursos como un bundle portable.")
     export.add_argument("project")
@@ -232,6 +276,9 @@ def main() -> None:
         elif args.command == "layer" and args.layer_action == "import-mask":
             layer_id = import_layer_mask(args.project, args.name, args.mask)
             _emit({"layer_id": layer_id})
+        elif args.command == "layer" and args.layer_action == "import-sprite":
+            layer_id = import_sprite_layer(args.project, args.name, args.sprite, visible=not args.hidden)
+            _emit({"layer_id": layer_id})
         elif args.command == "layer" and args.layer_action == "extract":
             sprite = extract_layer(args.project, args.layer_id)
             _emit({"sprite": str(sprite)})
@@ -255,7 +302,7 @@ def main() -> None:
             mask = accept_layer_mask_proposal(args.project, args.layer_id, args.proposal_id)
             _emit({"accepted_mask": str(mask)})
         elif args.command == "mesh" and args.mesh_action == "generate":
-            mesh = generate_layer_mesh(args.project, args.layer_id, args.spacing)
+            mesh = generate_layer_mesh(args.project, args.layer_id, args.spacing, bind_joint_id=args.joint)
             _emit({"layer_id": args.layer_id, "vertex_count": len(mesh["points"]), "triangle_count": len(mesh["triangles"])})
         elif args.command == "weight" and args.weight_action == "set":
             set_vertex_weight(args.project, args.layer_id, args.vertex, args.joint_id, args.value)
@@ -266,6 +313,9 @@ def main() -> None:
         elif args.command == "clip" and args.clip_action == "key":
             set_rotation_key(args.project, args.clip_id, args.joint_id, args.frame, args.rotation, args.interpolation)
             _emit({"clip_id": args.clip_id, "joint_id": args.joint_id, "frame": args.frame})
+        elif args.command == "clip" and args.clip_action == "visibility-key":
+            set_layer_visibility_key(args.project, args.clip_id, args.layer_id, args.frame, args.visibility == "visible")
+            _emit({"clip_id": args.clip_id, "layer_id": args.layer_id, "frame": args.frame, "visible": args.visibility == "visible"})
         elif args.command == "expression" and args.expression_action == "create":
             expression_id = create_expression(args.project, args.name)
             _emit({"expression_id": expression_id})
@@ -273,7 +323,8 @@ def main() -> None:
             set_expression_value(args.project, args.expression_id, args.target_id, args.value, args.type)
             _emit({"expression_id": args.expression_id, "target_id": args.target_id, "value": args.value})
         elif args.command == "ik" and args.ik_action == "solve":
-            result = solve_two_bone_ik(load_project(args.project)["joints"], args.root_id, args.middle_id, args.tip_id, args.x, args.y)
+            direction = 1 if args.bend_direction == "positive" else -1
+            result = solve_two_bone_ik(load_project(args.project)["joints"], args.root_id, args.middle_id, args.tip_id, args.x, args.y, direction)
             _emit({"rotations": result, "target": [args.x, args.y]})
         elif args.command == "pose" and args.pose_action == "render":
             rotations = {joint_id: float(value) for joint_id, value in args.rotation}
@@ -284,11 +335,65 @@ def main() -> None:
                     raise ProjectError(f"No existe el clip {args.clip}.")
                 clip_frame = args.frame % clip_data["duration"] if clip_data.get("loop") and clip_data["duration"] else args.frame
                 rotations = {**sample_clip(clip_data, clip_frame), **rotations}
-            image = render_project_pose(args.project, rotations, expression_id=args.expression)
+                visibility = sample_layer_visibility(clip_data, clip_frame)
+            else:
+                visibility = {}
+            image = render_project_pose(args.project, rotations, expression_id=args.expression, layer_visibility=visibility)
             output = Path(args.output).expanduser().resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)
             _emit({"render": str(output), "frame": args.frame, "clip": args.clip, "expression": args.expression})
+        elif args.command == "avatar3d" and args.avatar_action == "attach":
+            result = attach_avatar(args.project, args.model, actor="agent")
+            _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action == "autorig":
+            result = autorig_glb(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
+            _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action in {"inspect", "validate"}:
+            project_data = load_project(args.project)
+            result = validate_project_avatar(project_data, args.project)
+            if not result:
+                raise ProjectError("El proyecto no tiene un avatar3d registrado. Usa `rigmctl avatar3d attach`.")
+            _emit({"avatar": project_data.get("avatar3d"), "validation": result})
+            if result["errors"]:
+                raise SystemExit(2)
+        elif args.command == "avatar3d" and args.avatar_action == "validate-file":
+            suffix = Path(args.model).suffix.casefold()
+            if suffix not in {".glb", ".vrm"}:
+                raise ProjectError("Formato no compatible. Usa un archivo .glb o .vrm.")
+            result = validate_vrm(args.model) if suffix == ".vrm" else validate_glb(args.model)
+            _emit(result)
+            if result["errors"]:
+                raise SystemExit(2)
+        elif args.command == "behavior" and args.behavior_action == "render":
+            if args.fps < 1 or args.seconds < 0:
+                raise ProjectError("fps debe ser positivo y seconds no puede ser negativo.")
+            project_data = load_project(args.project)
+            runtime = BehaviorRuntime(project_data)
+            runtime.dispatch({"type": "state", "state": args.state, "intensity": args.intensity})
+            events = []
+            for encoded in args.event:
+                value = json.loads(encoded)
+                if not isinstance(value, dict):
+                    raise ProjectError("Cada --event debe ser un objeto JSON.")
+                event = value.get("event", value)
+                if event.get("type") in {"agent.status", "agent.phase", "tts.viseme", "speech.viseme", "speech.level", "agent.gesture", "agent.gaze"}:
+                    event = motion_event_from_agent(event)
+                events.append((max(0.0, float(value.get("at", 0.0))), event))
+            events.sort(key=lambda item: item[0])
+            event_index = 0
+            frame_count = round(args.seconds * args.fps)
+            for frame_index in range(frame_count + 1):
+                elapsed = frame_index / args.fps
+                while event_index < len(events) and events[event_index][0] <= elapsed:
+                    runtime.dispatch(events[event_index][1])
+                    event_index += 1
+                pose = runtime.update(1.0 / args.fps)
+            output = Path(args.output).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            image = render_project_pose(args.project, pose["rotations"], layer_visibility=pose["layer_visibility"], facial_parameters=pose["facial_parameters"], translation=pose.get("translation"))
+            image.save(output)
+            _emit({"render": str(output), "state": pose["state"], "seconds": args.seconds, "fps": args.fps, "facial_parameters": pose["facial_parameters"]})
         elif args.command == "export":
             output = export_bundle(args.project, args.output)
             _emit({"bundle": str(output)})

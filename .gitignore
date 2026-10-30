@@ -5,3 +5,5 @@ assets/
 dist/
 build/
 *.egg-info/
+node_modules/
+viewer3d/dist/

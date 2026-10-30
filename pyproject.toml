@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rigm"
 version = "0.1.0"
-description = "Editor de rigs 2D desde ilustraciones"
+description = "Editor de rigging 2D y avatares 3D GLB/VRM con animación reactiva"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["PyQt6>=6.7", "Pillow>=10.0"]
@@ -15,6 +15,7 @@ inpaint = ["opencv-python-headless>=4.9"]
 segmentation = ["torch>=2.1", "torchvision>=0.16", "transformers>=4.57"]
 rigging = ["opencv-python-headless>=4.9"]
 decomposition = ["gradio_client>=1.6", "psd-tools>=1.9"]
+avatar3d = ["PyQt6-WebEngine>=6.7"]
 
 [project.scripts]
 rigm = "rigm.app:main"
@@ -22,3 +23,6 @@ rigmctl = "rigm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+rigm = ["viewer3d_static/*"]

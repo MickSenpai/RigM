@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QInputDialog,
+    QLineEdit,
     QSlider,
     QTableWidget,
     QTableWidgetItem,
@@ -35,6 +36,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QButtonGroup,
     QScrollArea,
+    QSplitter,
     QSpinBox,
 )
 
@@ -43,8 +45,12 @@ from .project import (
     accept_layer_mask_proposal, inpaint_layer_holes, load_project,
     propose_layer_masks, render_composite, save_project, validate_project,
     create_animation_clip, create_expression, import_decomposition_psd, set_expression_value, set_rotation_key,
+    set_layer_visibility_key,
 )
-from .rig import generate_layer_mesh, render_project_pose, sample_clip, set_vertex_weight, solve_two_bone_ik
+from .rig import generate_layer_mesh, posed_joint_positions, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
+from .behavior import BehaviorRuntime, BEHAVIOR_STATES
+from .avatar3d import attach_avatar, autorig_glb, validate_project_avatar
+from .avatar3d_viewer import Avatar3DDialog
 from .export import export_bundle
 from .decomposition import decompose_project_with_see_through
 from PIL import Image as PILImage, ImageDraw
@@ -104,6 +110,26 @@ class DecompositionWorker(QThread):
             self.succeeded.emit(result)
 
 
+class AvatarAutoRigWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, project_path: Path, forward_axis: str, blender_path: str | None = None, expected_mtime_ns: int | None = None):
+        super().__init__()
+        self.project_path = project_path
+        self.forward_axis = forward_axis
+        self.blender_path = blender_path
+        self.expected_mtime_ns = expected_mtime_ns
+
+    def run(self) -> None:
+        try:
+            result = autorig_glb(self.project_path, blender_path=self.blender_path, forward_axis=self.forward_axis, actor="user", expected_mtime_ns=self.expected_mtime_ns)
+        except (OSError, ProjectError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
 class RigCanvas(QGraphicsView):
     changed = pyqtSignal()
     joint_added = pyqtSignal(str)
@@ -126,6 +152,7 @@ class RigCanvas(QGraphicsView):
         self.preview_enabled = False
         self.image_path: Path | None = None
         self.joints: list[dict[str, Any]] = []
+        self.preview_joint_positions: dict[str, tuple[float, float]] | None = None
         self.bones: list[list[str]] = []
         self.selected: list[str] = []
         self.inserting = False
@@ -165,6 +192,7 @@ class RigCanvas(QGraphicsView):
         self.preview_enabled = False
         self.image_path = path.resolve()
         self.joints.clear()
+        self.preview_joint_positions = None
         self.bones.clear()
         self.layers.clear()
         self.active_layer_id = None
@@ -269,13 +297,20 @@ class RigCanvas(QGraphicsView):
             painter.drawLine(point + QPointF(-12, 0), point + QPointF(12, 0))
             painter.drawLine(point + QPointF(0, -12), point + QPointF(0, 12))
         joint_by_id = {joint["id"]: joint for joint in self.joints}
+        posed_positions = self.preview_joint_positions if self.preview_enabled else None
+
+        def joint_point(joint: dict[str, Any]) -> QPointF:
+            x, y = (posed_positions or {}).get(
+                joint["id"], (float(joint["x"]), float(joint["y"]))
+            )
+            return QPointF(x, y)
+
         painter.setPen(QPen(QColor("#6ee7d8"), 2.5))
         for a, b in self.bones:
             if a in joint_by_id and b in joint_by_id:
-                ja, jb = joint_by_id[a], joint_by_id[b]
-                painter.drawLine(QPointF(ja["x"], ja["y"]), QPointF(jb["x"], jb["y"]))
+                painter.drawLine(joint_point(joint_by_id[a]), joint_point(joint_by_id[b]))
         for joint in self.joints:
-            point = QPointF(joint["x"], joint["y"])
+            point = joint_point(joint)
             is_selected = joint["id"] in self.selected
             color = QColor("#ffcf70" if is_selected else "#f1f5f9")
             painter.setPen(QPen(QColor("#151923"), 2.0))
@@ -513,8 +548,17 @@ class MainWindow(QMainWindow):
         self.loaded_mtime_ns: int | None = None
         self.preview_rotations: dict[str, float] = {}
         self.preview_layer_opacities: dict[str, float] = {}
+        self.preview_layer_visibility: dict[str, bool] = {}
         self.current_frame = 0
         self.playing = False
+        self.playback_direction = 1
+        self.playback_clock = QElapsedTimer()
+        self.playback_last_elapsed_ms = 0
+        self.playback_frame_remainder = 0.0
+        self.behavior_runtime: BehaviorRuntime | None = None
+        self.behavior_clock = QElapsedTimer()
+        self.behavior_last_elapsed_ms = 0
+        self.autorig_worker: AvatarAutoRigWorker | None = None
         self.library = library or ProjectLibrary()
         self.canvas = RigCanvas()
         self.canvas.joint_added.connect(self._add_joint_row)
@@ -681,6 +725,8 @@ class MainWindow(QMainWindow):
         self.ik_status = QLabel("Selecciona raíz, codo/rodilla y extremo con Ctrl.")
         self.ik_status.setWordWrap(True)
         layout.addWidget(self.ik_status)
+        self.ik_opposite_bend = QCheckBox("Flexionar al lado opuesto")
+        layout.addWidget(self.ik_opposite_bend)
         self.solve_ik_button = QPushButton("Resolver IK de la selección")
         self.solve_ik_button.setEnabled(False)
         self.solve_ik_button.clicked.connect(self._solve_ik_preview)
@@ -690,6 +736,34 @@ class MainWindow(QMainWindow):
         self.save_ik_button.clicked.connect(self._save_ik_keys)
         layout.addWidget(self.save_ik_button)
         layout.addWidget(QLabel("ANIMACIÓN"))
+        self.avatar3d_section_label = QLabel("IMPORTAR AVATAR 3D")
+        layout.addWidget(self.avatar3d_section_label)
+        self.avatar3d_attach_button = QPushButton("Importar GLB / VRM…")
+        self.avatar3d_attach_button.setEnabled(False)
+        self.avatar3d_attach_button.clicked.connect(self._attach_avatar3d)
+        layout.addWidget(self.avatar3d_attach_button)
+        self.avatar3d_viewer_button = QPushButton("Abrir visor 3D")
+        self.avatar3d_viewer_button.setEnabled(False)
+        self.avatar3d_viewer_button.setToolTip("Abre el GLB o VRM del proyecto en el visor 3D local.")
+        self.avatar3d_viewer_button.clicked.connect(self._open_avatar3d_viewer)
+        layout.addWidget(self.avatar3d_viewer_button)
+        behavior_row = QHBoxLayout()
+        self.behavior_enabled = QCheckBox("Simular agente")
+        self.behavior_enabled.setToolTip("Previsualiza estados reactivos en memoria; no cambia el archivo del proyecto.")
+        self.behavior_enabled.toggled.connect(self._toggle_behavior_simulation)
+        self.behavior_combo = QComboBox()
+        for state in BEHAVIOR_STATES:
+            self.behavior_combo.addItem({"idle":"Reposo", "listening":"Escuchando", "thinking":"Procesando", "speaking":"Hablando", "waiting":"Esperando", "restless":"Nerviosa · paseando", "error":"Error"}[state], state)
+        self.behavior_combo.currentIndexChanged.connect(self._set_behavior_state)
+        behavior_row.addWidget(self.behavior_enabled)
+        behavior_row.addWidget(self.behavior_combo)
+        layout.addLayout(behavior_row)
+        self.behavior_intensity = QSlider(Qt.Orientation.Horizontal)
+        self.behavior_intensity.setRange(0, 100)
+        self.behavior_intensity.setValue(35)
+        self.behavior_intensity.valueChanged.connect(self._set_behavior_intensity)
+        layout.addWidget(QLabel("Intensidad de movimiento"))
+        layout.addWidget(self.behavior_intensity)
         self.clip_combo = QComboBox()
         self.clip_combo.currentIndexChanged.connect(self._select_clip)
         layout.addWidget(self.clip_combo)
@@ -701,17 +775,61 @@ class MainWindow(QMainWindow):
         self.play_button.toggled.connect(self._toggle_playback)
         clip_buttons.addWidget(self.create_clip_button)
         clip_buttons.addWidget(self.play_button)
+        self.reverse_playback_checkbox = QCheckBox("Inversa")
+        self.reverse_playback_checkbox.setToolTip("Reproduce el clip hacia atrás sin cambiar sus claves.")
+        self.reverse_playback_checkbox.toggled.connect(self._set_playback_direction)
+        clip_buttons.addWidget(self.reverse_playback_checkbox)
+        clip_buttons.addWidget(QLabel("Velocidad"))
+        self.playback_speed_combo = QComboBox()
+        for speed in (0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0):
+            self.playback_speed_combo.addItem(f"{speed:g}×", speed)
+        self.playback_speed_combo.setCurrentIndex(self.playback_speed_combo.findData(1.5))
+        self.playback_speed_combo.setToolTip(
+            "Multiplica los fotogramas por segundo del clip. Si el render va más lento, "
+            "se saltan fotogramas intermedios para mantener este ritmo."
+        )
+        self.playback_speed_combo.currentIndexChanged.connect(self._set_playback_speed)
+        clip_buttons.addWidget(self.playback_speed_combo)
         layout.addLayout(clip_buttons)
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0, 60)
         self.frame_slider.valueChanged.connect(self._set_animation_frame)
         layout.addWidget(self.frame_slider)
+        frame_buttons = QHBoxLayout()
+        self.frame_start_button = QPushButton("⏮ Inicio")
+        self.frame_start_button.clicked.connect(lambda: self._go_to_frame_edge(False))
+        self.frame_back_button = QPushButton("◀ 1 fotograma")
+        self.frame_back_button.clicked.connect(lambda: self._step_animation_frame(-1))
+        self.frame_forward_button = QPushButton("1 fotograma ▶")
+        self.frame_forward_button.clicked.connect(lambda: self._step_animation_frame(1))
+        self.frame_end_button = QPushButton("Fin ⏭")
+        self.frame_end_button.clicked.connect(lambda: self._go_to_frame_edge(True))
+        for button in (self.frame_start_button, self.frame_back_button,
+                       self.frame_forward_button, self.frame_end_button):
+            frame_buttons.addWidget(button)
+        layout.addLayout(frame_buttons)
         self.frame_label = QLabel("Fotograma 0")
         layout.addWidget(self.frame_label)
+        interpolation_row = QHBoxLayout()
+        interpolation_row.addWidget(QLabel("Curva al guardar claves"))
+        self.interpolation_combo = QComboBox()
+        self.interpolation_combo.addItem("Cúbica monótona", "cubic")
+        self.interpolation_combo.addItem("Suave por tramo", "smooth")
+        self.interpolation_combo.addItem("Lineal", "linear")
+        self.interpolation_combo.setToolTip("La cúbica conserva la velocidad entre claves y evita frenadas en cada una.")
+        interpolation_row.addWidget(self.interpolation_combo)
+        layout.addLayout(interpolation_row)
         self.key_button = QPushButton("Guardar clave de rotación")
         self.key_button.setEnabled(False)
         self.key_button.clicked.connect(self._save_rotation_key)
         layout.addWidget(self.key_button)
+        self.layer_visibility_checkbox = QCheckBox("Capa seleccionada visible en este fotograma")
+        self.layer_visibility_checkbox.toggled.connect(self._preview_layer_visibility)
+        layout.addWidget(self.layer_visibility_checkbox)
+        self.layer_visibility_key_button = QPushButton("Guardar clave de visibilidad")
+        self.layer_visibility_key_button.setEnabled(False)
+        self.layer_visibility_key_button.clicked.connect(self._save_layer_visibility_key)
+        layout.addWidget(self.layer_visibility_key_button)
         layout.addWidget(QLabel("EXPRESIONES / CARA"))
         self.expression_combo = QComboBox()
         self.expression_combo.currentIndexChanged.connect(self._preview_expression)
@@ -753,8 +871,68 @@ class MainWindow(QMainWindow):
         panel_scroll.setWidget(panel)
         panel_scroll.setMinimumWidth(260)
         panel_scroll.setMaximumWidth(330)
-        row.addWidget(panel_scroll)
-        row.addWidget(self.canvas, 1)
+        self.tool_tabs = QTabWidget()
+        self.tool_tabs.setMinimumWidth(260)
+        self.tool_tabs.setMaximumWidth(330)
+        self.tool_tabs.addTab(panel_scroll, "2D · Ilustración")
+
+        # Move the shared avatar controls to their own 3D workspace. All existing
+        # image segmentation, masks, 2D rigging, clips and expressions stay together.
+        layout.removeWidget(self.avatar3d_section_label)
+        layout.removeWidget(self.avatar3d_attach_button)
+        layout.removeWidget(self.avatar3d_viewer_button)
+        avatar_panel = QWidget()
+        avatar_layout = QVBoxLayout(avatar_panel)
+        avatar_layout.addWidget(QLabel("AVATAR 3D · GLB / VRM"))
+        avatar_intro = QLabel(
+            "Puedes importar un GLB con o sin esqueleto. RigM propone un esqueleto y pesos desde la geometría "
+            "sin Blender; revisa el resultado porque la inferencia es aproximada."
+        )
+        avatar_intro.setWordWrap(True)
+        avatar_layout.addWidget(avatar_intro)
+        avatar_layout.addWidget(self.avatar3d_section_label)
+        avatar_layout.addWidget(self.avatar3d_attach_button)
+        avatar_layout.addWidget(QLabel("Frente del personaje (para el análisis)"))
+        self.autorig_forward_combo = QComboBox()
+        for axis, label in (("+Z", "+Z · GLB habitual"), ("-Z", "−Z"), ("+X", "+X"), ("-X", "−X")):
+            self.autorig_forward_combo.addItem(label, axis)
+        self.autorig_forward_combo.setToolTip("Dirección frontal del modelo glTF. El auto-rig geométrico actual infiere una pose humanoide erguida.")
+        avatar_layout.addWidget(self.autorig_forward_combo)
+        self.avatar3d_autorig_button = QPushButton("Analizar modelo y crear esqueleto")
+        self.avatar3d_autorig_button.setEnabled(False)
+        self.avatar3d_autorig_button.setToolTip("Propone huesos y pesos geométricos dentro del visor 3D. Conserva el GLB fuente.")
+        self.avatar3d_autorig_button.clicked.connect(self._auto_rig_avatar3d)
+        avatar_layout.addWidget(self.avatar3d_autorig_button)
+        self.avatar3d_rebuild_button = QPushButton("Rehacer esqueleto desde fuente")
+        self.avatar3d_rebuild_button.setEnabled(False)
+        self.avatar3d_rebuild_button.setToolTip("Vuelve al GLB original conservado en el proyecto y genera un rig nuevo.")
+        self.avatar3d_rebuild_button.clicked.connect(self._rebuild_avatar3d_from_source)
+        avatar_layout.addWidget(self.avatar3d_rebuild_button)
+        avatar_layout.addWidget(self.avatar3d_viewer_button)
+        self.avatar3d_info = QLabel("La inferencia asume un humanoide erguido. El rig generado es editable y requiere revisión de pivotes/pesos.")
+        self.avatar3d_info.setWordWrap(True)
+        avatar_layout.addWidget(self.avatar3d_info)
+        avatar_layout.addStretch(1)
+        avatar_scroll = QScrollArea()
+        avatar_scroll.setWidgetResizable(True)
+        avatar_scroll.setMinimumWidth(260)
+        avatar_scroll.setMaximumWidth(330)
+        avatar_scroll.setWidget(avatar_panel)
+        self.tool_tabs.addTab(avatar_scroll, "3D · Avatar")
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.setMinimumWidth(280)
+        self.preview_tabs.addTab(self.canvas, "Vista 2D")
+        self.avatar3d_placeholder = QLabel("Importa un GLB/VRM y abre la vista 3D para previsualizarlo.")
+        self.avatar3d_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_tabs.addTab(self.avatar3d_placeholder, "Vista 3D")
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(self.tool_tabs)
+        self.workspace_splitter.addWidget(self.preview_tabs)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([300, 880])
+        row.addWidget(self.workspace_splitter, 1)
 
         self.library_table = QTableWidget(0, 6)
         self.library_table.setHorizontalHeaderLabels(["Rig", "Estado", "Etapa", "Capas", "Progreso", "Actualizado"])
@@ -802,7 +980,11 @@ class MainWindow(QMainWindow):
         self.library_timer.timeout.connect(self.refresh_library)
         self.library_timer.start()
         self.playback_timer = QTimer(self)
+        self.playback_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.playback_timer.timeout.connect(self._advance_animation_frame)
+        self.behavior_timer = QTimer(self)
+        self.behavior_timer.setInterval(33)
+        self.behavior_timer.timeout.connect(self._advance_behavior_simulation)
 
     def _make_menu(self) -> None:
         file_menu = self.menuBar().addMenu("Archivo")
@@ -821,10 +1003,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
+            if self.behavior_runtime:
+                self.behavior_enabled.setChecked(False)
             self.canvas.set_image(Path(path))
             self._reset_prompt_tools()
             self.project_path = None
             self.loaded_mtime_ns = None
+            self.avatar3d_attach_button.setEnabled(False)
+            self.avatar3d_viewer_button.setEnabled(False)
+            self.avatar3d_autorig_button.setEnabled(False)
             self.reload_button.setEnabled(False)
             self.joint_list.clear()
             self.paint_button.setChecked(False)
@@ -869,12 +1056,32 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No pude abrir el proyecto", str(exc))
 
     def _open_project_file(self, project_path: Path) -> None:
+        if self.behavior_runtime:
+            self.behavior_enabled.setChecked(False)
         data = load_project(project_path)
         self.canvas.load_model(data, project_path)
         self._reset_prompt_tools()
         self.preview_rotations.clear()
         self.preview_layer_opacities.clear()
+        self.preview_layer_visibility.clear()
         self.project_path = project_path.resolve()
+        self.avatar3d_attach_button.setEnabled(True)
+        avatar = data.get("avatar3d", {})
+        if not isinstance(avatar, dict):
+            avatar = {}
+        self.avatar3d_viewer_button.setEnabled(bool(avatar))
+        self.avatar3d_autorig_button.setEnabled(bool(avatar and avatar.get("format") == "glb" and not avatar.get("rigged")))
+        source_model = avatar.get("source_path")
+        self.avatar3d_rebuild_button.setEnabled(bool(
+            avatar.get("format") == "glb" and avatar.get("rigged") and source_model
+            and (self.project_path.parent / source_model).is_file()
+        ))
+        self.avatar3d_info.setText(
+            "GLB con esqueleto" if avatar.get("format") == "glb" and avatar.get("rigged")
+            else "GLB sin esqueleto: puedes previsualizarlo o crear un auto-rig." if avatar.get("format") == "glb"
+            else "Avatar VRM con esqueleto humanoide." if avatar.get("format") == "vrm"
+            else "Importa un GLB o VRM. RigM puede proponer huesos para un GLB sin esqueleto."
+        )
         self.loaded_mtime_ns = self.project_path.stat().st_mtime_ns
         self.reload_button.setEnabled(False)
         self.joint_list.clear()
@@ -886,6 +1093,145 @@ class MainWindow(QMainWindow):
         self._set_ready(True)
         self.status.setText(f"Proyecto: {data.get('name', project_path.stem)} · {data.get('stage', 'skeleton')}")
         self.tabs.setCurrentIndex(1)
+
+    def _attach_avatar3d(self) -> None:
+        if self.project_path is None:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió desde que lo abriste. Recárgalo antes de importar un avatar.")
+            self.reload_button.setEnabled(True)
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Importar modelo 3D", "", "Modelos 3D (*.glb *.vrm)")
+        if not path:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió mientras elegías el modelo. Recárgalo antes de importar.")
+            self.reload_button.setEnabled(True)
+            return
+        try:
+            result = attach_avatar(self.project_path, path, actor="user")
+            self._open_project_file(self.project_path)
+            self.refresh_library()
+            warnings = result["validation"]["warnings"]
+            detail = "El modelo GLB está riggeado." if result["avatar"]["rigged"] else "El GLB se importó para análisis; no trae esqueleto todavía."
+            if result["avatar"]["format"] == "vrm":
+                detail = "El avatar VRM pasó la validación humanoide."
+            if warnings:
+                detail += " Revisa: " + " ".join(warnings)
+            self.status.setText(detail)
+            if result["avatar"]["format"] == "glb":
+                self.tool_tabs.setCurrentIndex(1)
+            self._open_avatar3d_viewer()
+        except (OSError, ProjectError) as exc:
+            QMessageBox.warning(self, "No pude importar el modelo 3D", str(exc))
+
+    def _auto_rig_avatar3d(self) -> None:
+        if self.project_path is None:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió desde que lo abriste. Recárgalo antes de crear el esqueleto.")
+            self.reload_button.setEnabled(True)
+            return
+        avatar = load_project(self.project_path).get("avatar3d", {})
+        if avatar.get("format") != "glb" or avatar.get("rigged"):
+            QMessageBox.information(self, "Auto-rig 3D", "Importa primero un GLB sin esqueleto.")
+            return
+        self._open_avatar3d_viewer()
+        dialog = getattr(self, "avatar3d_dialog", None)
+        if dialog and dialog.allow_autorig:
+            dialog.request_autorig()
+
+    def _choose_blender_binary(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Seleccionar ejecutable de Blender", "", "Todos los archivos (*)")
+        if path:
+            self.blender_path_edit.setText(path)
+
+    def _avatar_autorig_succeeded(self, result: dict[str, Any]) -> None:
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        analysis = result.get("analysis", {})
+        confidence = analysis.get("confidence", "low")
+        self.avatar3d_info.setText(f"Esqueleto creado · confianza geométrica {confidence}. Revisa huesos y pesos en Blender antes de animar.")
+        self.status.setText("Auto-rig 3D guardado. Se conservó el GLB original y el nuevo rig quedó dentro del proyecto.")
+        if analysis.get("warnings"):
+            QMessageBox.information(self, "Revisa el auto-rig", "\n".join(analysis["warnings"]))
+
+    def _avatar_autorig_failed(self, message: str) -> None:
+        self.avatar3d_attach_button.setEnabled(True)
+        self.avatar3d_viewer_button.setEnabled(True)
+        self.avatar3d_autorig_button.setEnabled(True)
+        self.avatar3d_info.setText(message)
+        QMessageBox.warning(self, "No pude crear el esqueleto", message)
+
+    def _avatar_autorig_finished(self) -> None:
+        self.autorig_worker = None
+
+    def _open_avatar3d_viewer(self, *, model_path_override: Path | None = None, allow_autorig_override: bool | None = None) -> None:
+        if self.project_path is None:
+            return
+        data = load_project(self.project_path)
+        result = validate_project_avatar(data, self.project_path)
+        if not result:
+            QMessageBox.information(self, "Avatar 3D", "Este proyecto aún no tiene un avatar GLB o VRM.")
+            return
+        if result["errors"]:
+            QMessageBox.warning(self, "Avatar 3D no válido", "\n".join(result["errors"]))
+            return
+        avatar = data["avatar3d"]
+        model_path = model_path_override or (self.project_path.parent / avatar["path"])
+        allow_autorig = avatar.get("format") == "glb" and not avatar.get("rigged")
+        if allow_autorig_override is not None:
+            allow_autorig = allow_autorig_override
+        try:
+            previous = getattr(self, "avatar3d_dialog", None)
+            if previous:
+                index = self.preview_tabs.indexOf(previous)
+                if index >= 0:
+                    self.preview_tabs.removeTab(index)
+                previous.deleteLater()
+            self.avatar3d_dialog = Avatar3DDialog(
+                model_path, avatar.get("name", "Avatar 3D"), self,
+                project_path=self.project_path, expected_mtime_ns=self.loaded_mtime_ns,
+                allow_autorig=allow_autorig,
+                forward_axis=self.autorig_forward_combo.currentData(),
+            )
+            self.avatar3d_dialog.setWindowFlags(Qt.WindowType.Widget)
+            self.avatar3d_dialog.setMinimumSize(0, 0)
+            self.avatar3d_dialog.autorig_saved.connect(self._embedded_autorig_saved)
+            self.avatar3d_dialog.autorig_failed.connect(lambda message: self.avatar3d_info.setText(message))
+            index = self.preview_tabs.addTab(self.avatar3d_dialog, "Vista 3D · Avatar")
+            self.preview_tabs.setCurrentIndex(index)
+            if result["warnings"]:
+                self.avatar3d_dialog.message.setText("Antes de evaluar la actuación, revisa estos avisos: " + " ".join(result["warnings"]))
+        except ProjectError as exc:
+            QMessageBox.information(self, "Instala el visor 3D", str(exc))
+
+    def _rebuild_avatar3d_from_source(self) -> None:
+        if self.project_path is None:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió desde que lo abriste. Recárgalo antes de rehacer el esqueleto.")
+            self.reload_button.setEnabled(True)
+            return
+        avatar = load_project(self.project_path).get("avatar3d", {})
+        source = avatar.get("source_path") if isinstance(avatar, dict) else None
+        if not source:
+            QMessageBox.information(self, "Fuente no disponible", "Este avatar no conserva una ruta de fuente para reconstruir el auto-rig.")
+            return
+        source_path = (self.project_path.parent / source).resolve()
+        if not source_path.is_relative_to(self.project_path.parent.resolve()) or not source_path.is_file():
+            QMessageBox.warning(self, "Fuente no disponible", "No encuentro el GLB fuente conservado dentro del proyecto.")
+            return
+        self._open_avatar3d_viewer(model_path_override=source_path, allow_autorig_override=True)
+
+    def _embedded_autorig_saved(self, _payload: dict[str, Any]) -> None:
+        if self.project_path is None:
+            return
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        self.avatar3d_info.setText("GLB actualizado. RigM conserva las versiones fuente; revisa la pose neutral, pivotes y deformación.")
+        self.status.setText("Avatar 3D actualizado en el proyecto.")
+        self._open_avatar3d_viewer()
 
     def open_selected_project(self) -> None:
         row = self.library_table.currentRow()
@@ -1052,6 +1398,7 @@ class MainWindow(QMainWindow):
         if self.paint_button.isChecked():
             self.paint_button.setChecked(False)
         self._refresh_weight_controls()
+        self._refresh_layer_visibility_control()
         self._preview_expression(self.expression_combo.currentIndex())
         self._refresh_proposals_for_current_layer()
 
@@ -1396,6 +1743,7 @@ class MainWindow(QMainWindow):
             self.frame_slider.setValue(min(old_frame, self.frame_slider.maximum()))
         editable = not self._project_has_external_changes()
         self.key_button.setEnabled(editable and self.canvas.active_layer_id is not None and self.clip_combo.count() > 0 and len(self.canvas.selected) == 1)
+        self._refresh_layer_visibility_control()
         self.create_clip_button.setEnabled(editable)
         self.create_expression_button.setEnabled(editable)
         self._refresh_weight_controls()
@@ -1451,7 +1799,8 @@ class MainWindow(QMainWindow):
         if len(self.canvas.selected) != 3 or not self.canvas.ik_target:
             return
         try:
-            angles = solve_two_bone_ik(self.canvas.joints, *self.canvas.selected, *self.canvas.ik_target)
+            bend = -1 if self.ik_opposite_bend.isChecked() else 1
+            angles = solve_two_bone_ik(self.canvas.joints, *self.canvas.selected, *self.canvas.ik_target, bend)
             self.preview_rotations.update(angles)
             self.rotation_slider.blockSignals(True)
             selected_rotation = round(angles.get(self.canvas.selected[0], 0))
@@ -1496,6 +1845,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No pude crear el clip", str(exc))
 
     def _select_clip(self, index: int) -> None:
+        self.preview_layer_visibility.clear()
         clip_id = self.clip_combo.itemData(index) if index >= 0 else None
         clip = None
         if clip_id and self.project_path:
@@ -1508,13 +1858,94 @@ class MainWindow(QMainWindow):
         self.frame_slider.blockSignals(False)
         self.key_button.setEnabled(bool(clip and len(self.canvas.selected) == 1 and not self._project_has_external_changes()))
         if clip:
-            self.playback_timer.setInterval(max(16, round(1000 / int(clip.get("fps", 30)))))
+            self._update_playback_interval(clip)
+        self._refresh_layer_visibility_control()
         self._render_current_pose()
 
     def _set_animation_frame(self, frame: int) -> None:
         self.current_frame = int(frame)
+        self.preview_layer_visibility.clear()
         self.frame_label.setText(f"Fotograma {frame}")
+        self._refresh_layer_visibility_control()
         self._render_current_pose()
+
+    def _set_playback_direction(self, reverse: bool) -> None:
+        self.playback_direction = -1 if reverse else 1
+
+    def _step_animation_frame(self, amount: int) -> None:
+        if self.playing:
+            self.play_button.setChecked(False)
+        self.frame_slider.setValue(max(self.frame_slider.minimum(), min(
+            self.frame_slider.maximum(), self.frame_slider.value() + amount
+        )))
+
+    def _go_to_frame_edge(self, end: bool) -> None:
+        if self.playing:
+            self.play_button.setChecked(False)
+        self.frame_slider.setValue(self.frame_slider.maximum() if end else self.frame_slider.minimum())
+
+    def _set_playback_speed(self, _index: int = -1) -> None:
+        if not hasattr(self, "playback_timer"):
+            return
+        clip_id = self.clip_combo.currentData()
+        if not clip_id or not self.project_path:
+            return
+        data = load_project(self.project_path)
+        clip = next((item for item in data.get("animations", []) if item.get("id") == clip_id), None)
+        if clip:
+            self._update_playback_interval(clip)
+
+    def _update_playback_interval(self, clip: dict[str, Any]) -> None:
+        fps = max(1.0, float(clip.get("fps", 30)))
+        speed = float(self.playback_speed_combo.currentData() or 1.0)
+        self.playback_timer.setInterval(max(1, round(1000 / (fps * speed))))
+
+    def _refresh_layer_visibility_control(self) -> None:
+        if not hasattr(self, "layer_visibility_checkbox"):
+            return
+        layer_id = self.canvas.active_layer_id
+        layer = next((item for item in self.canvas.layers if item.get("id") == layer_id), None)
+        visible = bool(layer.get("visible", True)) if layer else True
+        clip_id = self.clip_combo.currentData() if hasattr(self, "clip_combo") else None
+        if clip_id and self.project_path:
+            data = load_project(self.project_path)
+            clip = next((item for item in data.get("animations", []) if item.get("id") == clip_id), None)
+            if clip:
+                frame = self.current_frame % clip["duration"] if clip.get("loop") and clip["duration"] else self.current_frame
+                visible = sample_layer_visibility(clip, frame).get(layer_id, visible)
+        visible = self.preview_layer_visibility.get(layer_id, visible) if layer_id else visible
+        self.layer_visibility_checkbox.blockSignals(True)
+        self.layer_visibility_checkbox.setChecked(visible)
+        self.layer_visibility_checkbox.blockSignals(False)
+        editable = bool(layer and clip_id and not self._project_has_external_changes())
+        self.layer_visibility_checkbox.setEnabled(bool(layer and not self._project_has_external_changes()))
+        self.layer_visibility_key_button.setEnabled(editable)
+
+    def _preview_layer_visibility(self, visible: bool) -> None:
+        layer_id = self.canvas.active_layer_id
+        if layer_id:
+            self.preview_layer_visibility[layer_id] = bool(visible)
+            self._render_current_pose()
+
+    def _save_layer_visibility_key(self) -> None:
+        layer_id = self.canvas.active_layer_id
+        clip_id = self.clip_combo.currentData()
+        if not self.project_path or not layer_id or not clip_id:
+            return
+        try:
+            if self._project_has_external_changes():
+                raise ProjectError("Recarga el proyecto antes de guardar una clave.")
+            set_layer_visibility_key(
+                self.project_path, clip_id, layer_id, self.current_frame,
+                self.layer_visibility_checkbox.isChecked(), actor="user",
+            )
+            self.loaded_mtime_ns = self.project_path.stat().st_mtime_ns
+            self.preview_layer_visibility.pop(layer_id, None)
+            self._refresh_layer_visibility_control()
+            self._render_current_pose()
+            self.status.setText(f"Clave de visibilidad guardada en el fotograma {self.current_frame}.")
+        except (OSError, ProjectError) as exc:
+            QMessageBox.warning(self, "No pude guardar la visibilidad", str(exc))
 
     def _toggle_playback(self, playing: bool) -> None:
         if playing and not self.clip_combo.currentData():
@@ -1522,8 +1953,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Sin clip", "Crea un clip y añade claves antes de reproducir.")
             return
         self.playing = bool(playing)
+        self.preview_layer_visibility.clear()
         self.play_button.setText("■ Detener" if playing else "▶ Reproducir")
         if playing:
+            self.playback_clock.start()
+            self.playback_last_elapsed_ms = 0
+            self.playback_frame_remainder = 0.0
             self.playback_timer.start()
         else:
             self.playback_timer.stop()
@@ -1538,13 +1973,29 @@ class MainWindow(QMainWindow):
         if clip is None:
             self.play_button.setChecked(False)
             return
-        next_frame = self.current_frame + 1
-        if next_frame > int(clip["duration"]):
-            if clip.get("loop", True):
-                next_frame = 0
-            else:
-                self.play_button.setChecked(False)
-                return
+        elapsed_ms = self.playback_clock.elapsed()
+        elapsed_delta = max(0, elapsed_ms - self.playback_last_elapsed_ms)
+        self.playback_last_elapsed_ms = elapsed_ms
+        fps = max(1.0, float(clip.get("fps", 30)))
+        speed = float(self.playback_speed_combo.currentData() or 1.0)
+        advanced = self.playback_frame_remainder + elapsed_delta * fps * speed / 1000.0
+        frame_steps = int(advanced)
+        self.playback_frame_remainder = advanced - frame_steps
+        if frame_steps == 0:
+            return
+
+        duration = int(clip["duration"])
+        next_frame = self.current_frame + self.playback_direction * frame_steps
+        if clip.get("loop", True):
+            next_frame %= duration + 1
+        elif next_frame > duration or next_frame < 0:
+            next_frame = duration if self.playback_direction > 0 else 0
+            self.playback_timer.stop()
+            self.playing = False
+            self.play_button.blockSignals(True)
+            self.play_button.setChecked(False)
+            self.play_button.setText("▶ Reproducir")
+            self.play_button.blockSignals(False)
         self.frame_slider.setValue(next_frame)
 
     def _preview_joint_rotation(self, value: int) -> None:
@@ -1565,7 +2016,8 @@ class MainWindow(QMainWindow):
                 raise ProjectError("Recarga el proyecto antes de guardar una clave.")
             set_rotation_key(
                 self.project_path, self.clip_combo.currentData(), self.canvas.selected[0],
-                self.current_frame, float(self.rotation_slider.value()), actor="user",
+                self.current_frame, float(self.rotation_slider.value()),
+                interpolation=self.interpolation_combo.currentData(), actor="user",
             )
             self.loaded_mtime_ns = self.project_path.stat().st_mtime_ns
             self._refresh_motion_controls()
@@ -1633,7 +2085,8 @@ class MainWindow(QMainWindow):
         try:
             if self._project_has_external_changes():
                 raise ProjectError("Recarga el proyecto antes de guardar claves IK.")
-            angles = solve_two_bone_ik(self.canvas.joints, *self.canvas.selected, *self.canvas.ik_target)
+            bend = -1 if self.ik_opposite_bend.isChecked() else 1
+            angles = solve_two_bone_ik(self.canvas.joints, *self.canvas.selected, *self.canvas.ik_target, bend)
             for joint_id, angle in angles.items():
                 set_rotation_key(self.project_path, self.clip_combo.currentData(), joint_id,
                                  self.current_frame, angle, actor="user")
@@ -1643,26 +2096,88 @@ class MainWindow(QMainWindow):
         except (OSError, ProjectError) as exc:
             QMessageBox.warning(self, "No pude guardar las claves IK", str(exc))
 
+    def _toggle_behavior_simulation(self, enabled: bool) -> None:
+        if enabled and self.project_path is None:
+            self.behavior_enabled.blockSignals(True)
+            self.behavior_enabled.setChecked(False)
+            self.behavior_enabled.blockSignals(False)
+            self.status.setText("Abre un proyecto antes de simular el comportamiento.")
+            return
+        if enabled:
+            if self.playing:
+                self.play_button.setChecked(False)
+            try:
+                self.behavior_runtime = BehaviorRuntime(load_project(self.project_path))
+                self.behavior_runtime.dispatch({"type": "state", "state": self.behavior_combo.currentData(), "intensity": self.behavior_intensity.value() / 100})
+                self.behavior_clock.start()
+                self.behavior_last_elapsed_ms = 0
+                self.behavior_timer.start()
+                self.status.setText("Simulación reactiva activa · los eventos y la pose son temporales.")
+            except (OSError, ProjectError) as exc:
+                self.behavior_enabled.setChecked(False)
+                self.status.setText(f"No pude iniciar la simulación: {exc}")
+        else:
+            self.behavior_timer.stop()
+            self.behavior_runtime = None
+            self._render_current_pose()
+
+    def _set_behavior_state(self, _index: int = -1) -> None:
+        if self.behavior_runtime:
+            self.behavior_runtime.dispatch({"type": "state", "state": self.behavior_combo.currentData(), "intensity": self.behavior_intensity.value() / 100})
+
+    def _set_behavior_intensity(self, value: int) -> None:
+        if self.behavior_runtime:
+            self.behavior_runtime.dispatch({"type": "parameter", "name": "intensity", "value": value / 100})
+
+    def _advance_behavior_simulation(self) -> None:
+        if not self.behavior_runtime or not self.project_path:
+            self.behavior_timer.stop()
+            return
+        elapsed_ms = self.behavior_clock.elapsed()
+        dt = max(0.0, (elapsed_ms - self.behavior_last_elapsed_ms) / 1000.0)
+        self.behavior_last_elapsed_ms = elapsed_ms
+        self.behavior_runtime.update(dt)
+        self._render_current_pose()
+
     def _render_current_pose(self) -> None:
         if self.project_path is None:
             return
         try:
+            data = load_project(self.project_path)
             rotations: dict[str, float] = {}
+            layer_visibility: dict[str, bool] = {}
+            facial_parameters = None
+            translation = (0.0, 0.0)
+            if self.behavior_runtime:
+                behavior_pose = self.behavior_runtime.pose
+                rotations.update(behavior_pose["rotations"])
+                layer_visibility.update(behavior_pose["layer_visibility"])
+                facial_parameters = behavior_pose["facial_parameters"]
+                translation = behavior_pose.get("translation", translation)
             clip_id = self.clip_combo.currentData()
-            if clip_id:
-                data = load_project(self.project_path)
+            if clip_id and not self.behavior_runtime:
                 clip = next((item for item in data.get("animations", []) if item.get("id") == clip_id), None)
                 if clip:
                     frame = self.current_frame % clip["duration"] if self.playing and clip.get("loop") and clip["duration"] else self.current_frame
                     rotations.update(sample_clip(clip, frame))
+                    layer_visibility.update(sample_layer_visibility(clip, frame))
             if not self.playing:
                 rotations.update(self.preview_rotations)
+                layer_visibility.update(self.preview_layer_visibility)
             image = render_project_pose(
                 self.project_path, rotations, self.preview_layer_opacities,
-                self.expression_combo.currentData(),
+                self.expression_combo.currentData(), layer_visibility, facial_parameters, translation,
             ).convert("RGBA")
             qimage = QImage(image.tobytes(), image.width, image.height, image.width * 4, QImage.Format.Format_RGBA8888).copy()
             self.canvas.composite_preview = QPixmap.fromImage(qimage)
+            self.canvas.preview_joint_positions = posed_joint_positions(
+                data.get("joints", []), rotations
+            )
+            if translation != (0.0, 0.0):
+                self.canvas.preview_joint_positions = {
+                    joint_id: (position[0] + translation[0], position[1] + translation[1])
+                    for joint_id, position in self.canvas.preview_joint_positions.items()
+                }
             self.canvas.preview_enabled = True
             if not self.preview_button.isChecked():
                 self.preview_button.setChecked(True)
@@ -1927,6 +2442,7 @@ class MainWindow(QMainWindow):
             self.decomposition_worker.wait()
         self.library_timer.stop()
         self.playback_timer.stop()
+        self.behavior_timer.stop()
         event.accept()
 
 
